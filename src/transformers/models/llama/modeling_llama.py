@@ -981,17 +981,15 @@ class LlamaModel(LlamaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # past_seen_tokens = 0
+        past_seen_tokens = 0
         if use_cache:  # kept for BC (cache positions)
             if not isinstance(past_key_values, StaticCache):
-                if past_key_values is None:
-                    past_key_values = DynamicCache()
-                else:
-                    past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-                # past_seen_tokens = past_key_values.get_seq_length()  if self.config.proportion_attn_var is None else 0
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                past_seen_tokens = past_key_values.get_seq_length()  if self.config.proportion_attn_var is None else 0
 
         if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length()  if self.config.proportion_attn_var is None or inputs_embeds.shape[1]==1 else 0
+            if isinstance(past_key_values, StaticCache):
+                raise ValueError("cache_position is a required argument when using StaticCache.")
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
@@ -1135,7 +1133,7 @@ class LlamaModel(LlamaPreTrainedModel):
             if attention_mask is not None and 0.0 in attention_mask:
                 return attention_mask
             return None
-        # output_attentions = False
+        output_attentions = False
         if self.config._attn_implementation == "sdpa" and not output_attentions:
             # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument,
             # in order to dispatch on Flash Attention 2.
@@ -1151,7 +1149,9 @@ class LlamaModel(LlamaPreTrainedModel):
             target_length = self.config.max_position_embeddings
         else:  # dynamic cache
             target_length = (
-                past_seen_tokens + sequence_length
+                attention_mask.shape[-1]
+                if isinstance(attention_mask, torch.Tensor)
+                else past_seen_tokens + sequence_length + 1
             )
 
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
