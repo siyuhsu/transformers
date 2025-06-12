@@ -378,6 +378,7 @@ class DynamicCache(Cache):
         self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
         self.key_cache: List[torch.Tensor] = []
         self.value_cache: List[torch.Tensor] = []
+        self.cache_position: torch.Tensor = None
 
     def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
         """
@@ -428,11 +429,26 @@ class DynamicCache(Cache):
             A tuple containing the updated key and value states.
         """
         # Update the number of seen tokens
+        if cache_kwargs is not None:
+            cache_position = cache_kwargs.get("cache_position", None)
+        else: 
+            cache_position = torch.arange(key_states.size(-2), device=key_states.device)
+
         if layer_idx == 0:
-            self._seen_tokens += key_states.shape[-2]
+            if self._seen_tokens == 0:
+                self._seen_tokens += key_states.shape[-2]
+            elif key_states.shape[-2] == 1:
+                self._seen_tokens += 1
+            
+
+            if self.cache_position is None and cache_position is not None:
+                self.cache_position = cache_position.unsqueeze(0)
+            elif cache_position is not None and cache_position.size(-1) == 1:
+                self.cache_position = torch.cat([self.cache_position, cache_position.unsqueeze(0)], dim=-1)
 
         # Update the cache
         if key_states is not None:
+            assert cache_position.size(-1) <= self._seen_tokens , f"cache_position: {cache_position.size(-1)} seen_tokens: {self._seen_tokens}"
             if len(self.key_cache) <= layer_idx:
                 # There may be skipped layers, fill them with empty lists
                 for _ in range(len(self.key_cache), layer_idx):
@@ -445,10 +461,15 @@ class DynamicCache(Cache):
             ):  # fills previously skipped layers; checking for tensor causes errors
                 self.key_cache[layer_idx] = key_states
                 self.value_cache[layer_idx] = value_states
-            else:
+            elif cache_position.size(-1) <= self._seen_tokens and cache_position.size(-1) != 1:
+                self.key_cache[layer_idx].index_copy_(2, cache_position, key_states)
+                self.value_cache[layer_idx].index_copy_(2, cache_position, value_states)
+            elif cache_position.size(-1) == 1:
                 self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
                 self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=-2)
-
+            else:  
+                print(f"cache_position: {cache_position.size(-1)} seen_tokens: {self._seen_tokens}")
+                
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
@@ -494,6 +515,9 @@ class DynamicCache(Cache):
         # In case it is negative
         if max_length < 0:
             max_length = self.get_seq_length() - abs(max_length)
+        
+        if self.cache_position is not None:
+            self.cache_position = self.cache_position[:, :max_length]
 
         if self.get_seq_length() <= max_length:
             return
@@ -504,6 +528,20 @@ class DynamicCache(Cache):
                 self.key_cache[idx] = self.key_cache[idx][..., :max_length, :]
                 self.value_cache[idx] = self.value_cache[idx][..., :max_length, :]
 
+    def drop_tokens(self, keep_indices: list):
+        """Drop tokens not in the `keep_indices` list. This is used in contrastive search."""
+        # Create a mask with True values at the positions to keep
+        mask = torch.zeros(self.get_seq_length(), dtype=torch.bool)
+        mask[keep_indices] = True
+        self._seen_tokens = mask.sum().item()
+        
+        if self.cache_position is not None:
+            self.cache_position = self.cache_position[:, mask]
+        for idx in range(len(self.key_cache)):
+            if self.key_cache[idx] != []:
+                self.key_cache[idx] = self.key_cache[idx][..., mask, :]
+                self.value_cache[idx] = self.value_cache[idx][..., mask, :]
+                
     @deprecate_kwarg("num_hidden_layers", version="4.47.0")
     def batch_split(
         self, full_batch_size: int, split_size: int, num_hidden_layers: int = None
